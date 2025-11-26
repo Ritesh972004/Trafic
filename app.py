@@ -1,341 +1,406 @@
+# app.py
+"""
+Streamlit app for YOLO-based traffic detection + simple speed estimation.
+
+Usage:
+- Place a YOLO model file (e.g., yolov8n.pt) in the repo or upload it in the app.
+- Run: streamlit run app.py
+
+Requirements (example):
+streamlit
+ultralytics
+opencv-python-headless
+numpy
+pandas
+pillow
+moviepy
+"""
+
+import os
+import io
 import tempfile
 import time
-from collections import defaultdict, deque
+from typing import List, Dict, Tuple
 
-import cv2
+import streamlit as st
 import numpy as np
 import pandas as pd
-import streamlit as st
+from PIL import Image
+import cv2
 from ultralytics import YOLO
+import moviepy.editor as mpy
 
+# ---------------------------
+# Helpers: caching & parsing
+# ---------------------------
+st.set_page_config(layout="wide", page_title="Traffic Detection (YOLO + Streamlit)")
 
-# ================== ORIGINAL BACKEND (LIGHTLY ADAPTED) ==================
+@st.cache_resource
+def load_model(model_path: str):
+    """Load and cache YOLO model. model_path can be local file path or a remote model string."""
+    try:
+        model = YOLO(model_path)
+        return model
+    except Exception as e:
+        st.error(f"Failed to load model from {model_path}: {e}")
+        raise
 
-class TrafficSurveillanceSystem:
-    def __init__(self):
-        self.vehicle_classes = ["car", "truck", "bus", "motorbike", "bicycle"]
-        self.model = None
-        self.tracked_vehicles = {}
-        self.next_vehicle_id = 0
-        self.speed_data = defaultdict(lambda: {
-            'coordinates': deque(maxlen=30),
-            'frames': deque(maxlen=30),
-            'speeds': []
-        })
-        self.meter_per_pixel = 0.05
-        self.min_detection_frames = 5
-        self.video_stats = {}
-        self.frame_stats = []
+def read_image_from_bytes(image_bytes: bytes) -> np.ndarray:
+    arr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return img
 
-    def load_model(self, model_name="yolov8x.pt"):
-        if self.model is None:
-            self.model = YOLO(model_name)
-        return self.model
+def pil_to_cv2(pil_img: Image.Image) -> np.ndarray:
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-    def set_calibration(self, meter_per_pixel):
-        self.meter_per_pixel = meter_per_pixel
+def cv2_to_pil(cv_img: np.ndarray) -> Image.Image:
+    return Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
 
-    def get_centroid(self, box):
+def parse_yolo_results(results) -> List[Dict]:
+    """
+    Given ultralytics Results (possibly list), produce list of detections for first result:
+    Each detection: {xmin,ymin,xmax,ymax,conf,cls,name}
+    """
+    detections = []
+    if not results:
+        return detections
+    res = results[0]  # results object for single image/frame
+
+    # Try known shapes (ultralytics v8.x)
+    try:
+        boxes = res.boxes  # Boxes object
+        # boxes.xyxyn or boxes.xyxy
+        xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes, "xyxy") else None
+        confs = boxes.conf.cpu().numpy() if hasattr(boxes, "conf") else None
+        clss = boxes.cls.cpu().numpy().astype(int) if hasattr(boxes, "cls") else None
+        names = res.names if hasattr(res, "names") else {}
+        if xyxy is not None:
+            for i, b in enumerate(xyxy):
+                xmin, ymin, xmax, ymax = map(float, b[:4])
+                conf = float(confs[i]) if confs is not None else float(b[4]) if b.shape[0] > 4 else 1.0
+                cls = int(clss[i]) if clss is not None else int(b[5]) if b.shape[0] > 5 else -1
+                name = names.get(cls, str(cls))
+                detections.append({"xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax, "conf": conf, "cls": cls, "name": name})
+            return detections
+    except Exception:
+        pass
+
+    # Fallback: try converting to pandas or .boxes.data
+    try:
+        if hasattr(res, "boxes") and hasattr(res.boxes, "data"):
+            data = res.boxes.data.cpu().numpy()  # each row: [x1,y1,x2,y2,confidence,class]
+            names = res.names if hasattr(res, "names") else {}
+            for row in data:
+                xmin, ymin, xmax, ymax, conf, cls = map(float, row[:6])
+                cls = int(cls)
+                name = names.get(cls, str(cls))
+                detections.append({"xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax, "conf": conf, "cls": cls, "name": name})
+            return detections
+    except Exception:
+        pass
+
+    # As last resort: attempt attribute access
+    try:
+        for box in getattr(res, "boxes", []):
+            coords = getattr(box, "xyxy", None)
+            conf = float(getattr(box, "conf", 0.0))
+            cls = int(getattr(box, "cls", -1))
+            if coords is not None:
+                if isinstance(coords, (list, tuple, np.ndarray)):
+                    xmin, ymin, xmax, ymax = coords[0] if isinstance(coords[0], (list, tuple, np.ndarray)) else coords
+                else:
+                    xmin, ymin, xmax, ymax = coords
+                name = getattr(res, "names", {}).get(cls, str(cls))
+                detections.append({"xmin": float(xmin), "ymin": float(ymin), "xmax": float(xmax), "ymax": float(ymax), "conf": conf, "cls": cls, "name": name})
+    except Exception:
+        pass
+
+    return detections
+
+def draw_boxes_on_image(img: np.ndarray, detections: List[Dict], show_conf: bool=True) -> np.ndarray:
+    """Draw rectangles and labels on BGR image and return annotated BGR image."""
+    out = img.copy()
+    h, w = out.shape[:2]
+    for det in detections:
+        x1, y1, x2, y2 = int(det["xmin"]), int(det["ymin"]), int(det["xmax"]), int(det["ymax"])
+        label = f"{det.get('name',det.get('cls',''))} {det.get('conf',0):.2f}" if show_conf else f"{det.get('name',det.get('cls',''))}"
+        # color by class id
+        color = tuple(int(c) for c in np.random.RandomState(det.get("cls",0)).randint(0,255,3))
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        # label background
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(out, (x1, y1 - 18), (x1 + tw + 4, y1), color, -1)
+        cv2.putText(out, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
+    return out
+
+# ---------------------------
+# Simple tracker for speed
+# ---------------------------
+class SimpleTracker:
+    """Very simple centroid-based tracker used for per-frame matching. Not for production."""
+    def __init__(self, max_lost=3):
+        self.next_object_id = 0
+        self.objects = {}  # object_id -> centroid
+        self.lost = {}     # object_id -> lost frames
+        self.max_lost = max_lost
+        self.hist_positions = {}  # object_id -> list of (frame_idx, centroid)
+
+    @staticmethod
+    def centroid_from_box(box):
         x1, y1, x2, y2 = box
-        return ((x1 + x2) / 2, y2)
+        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
 
-    def calculate_iou(self, box1, box2):
-        x1_1, y1_1, x2_1, y2_1 = box1
-        x1_2, y1_2, x2_2, y2_2 = box2
+    def update(self, detections: List[Dict], frame_idx: int):
+        centroids = [self.centroid_from_box((d["xmin"], d["ymin"], d["xmax"], d["ymax"])) for d in detections]
+        if len(self.objects) == 0:
+            for c in centroids:
+                oid = self.next_object_id
+                self.objects[oid] = c
+                self.lost[oid] = 0
+                self.hist_positions[oid] = [(frame_idx, c)]
+                self.next_object_id += 1
+            return {i: idx for i, idx in enumerate(range(self.next_object_id - len(centroids), self.next_object_id))}
 
-        xi1, yi1 = max(x1_1, x1_2), max(y1_1, y1_2)
-        xi2, yi2 = min(x2_1, x2_2), min(y2_1, y2_2)
+        # match centroids to existing objects by nearest neighbor
+        obj_ids = list(self.objects.keys())
+        obj_centroids = np.array([self.objects[oid] for oid in obj_ids])
+        new_centroids = np.array(centroids) if centroids else np.empty((0,2))
+        assigned = {}
+        if new_centroids.shape[0] > 0 and len(obj_centroids) > 0:
+            dists = np.linalg.norm(obj_centroids[:,None,:] - new_centroids[None,:,:], axis=2)  # shape (n_obj, n_new)
+            # greedy assignment
+            while True:
+                idx = np.unravel_index(np.argmin(dists), dists.shape)
+                minval = dists[idx]
+                if np.isinf(minval):
+                    break
+                obj_idx, new_idx = idx
+                oid = obj_ids[obj_idx]
+                assigned[new_idx] = oid
+                # mark row and col as assigned by setting to inf
+                dists[obj_idx,:] = np.inf
+                dists[:,new_idx] = np.inf
+                if np.all(np.isinf(dists)):
+                    break
 
-        inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-        box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
-        box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
-        union_area = box1_area + box2_area - inter_area
+        # update assigned
+        used_oids = set()
+        for new_idx, oid in assigned.items():
+            c = tuple(new_centroids[new_idx].tolist())
+            self.objects[oid] = c
+            self.lost[oid] = 0
+            self.hist_positions[oid].append((frame_idx, c))
+            used_oids.add(oid)
 
-        return inter_area / union_area if union_area > 0 else 0
+        # unassigned new centroids -> create new objects
+        for new_idx in range(new_centroids.shape[0]):
+            if new_idx not in assigned:
+                oid = self.next_object_id
+                c = tuple(new_centroids[new_idx].tolist())
+                self.objects[oid] = c
+                self.lost[oid] = 0
+                self.hist_positions[oid] = [(frame_idx, c)]
+                self.next_object_id += 1
+                assigned[new_idx] = oid
 
-    def calculate_distance(self, point1, point2):
-        return np.sqrt((point1[0] - point2[0])**2 + (point1[1] - point2[1])**2)
+        # increment lost for not-updated objects
+        for oid in list(self.objects.keys()):
+            if oid not in used_oids and oid not in assigned.values():
+                self.lost[oid] += 1
+                if self.lost[oid] > self.max_lost:
+                    # remove
+                    self.objects.pop(oid, None)
+                    self.lost.pop(oid, None)
+                    # keep hist_positions for reporting
 
-    def calculate_speed(self, vehicle_id, current_position, current_frame, fps):
-        speed_info = self.speed_data[vehicle_id]
-        speed_info['coordinates'].append(current_position)
-        speed_info['frames'].append(current_frame)
+        # return map: detection_index -> object_id
+        return assigned
 
-        if len(speed_info['coordinates']) < max(2, int(fps / 2)):
-            return None
-
-        start_pos = speed_info['coordinates'][0]
-        end_pos = speed_info['coordinates'][-1]
-
-        pixel_distance = np.sqrt(
-            (end_pos[0] - start_pos[0])**2 + (end_pos[1] - start_pos[1])**2
-        )
-        distance_meters = pixel_distance * self.meter_per_pixel
-
-        frame_diff = speed_info['frames'][-1] - speed_info['frames'][0]
-        time_seconds = frame_diff / fps
-
-        if time_seconds > 0:
-            speed_kmh = (distance_meters / time_seconds) * 3.6
-            if 0 < speed_kmh < 200:
-                speed_info['speeds'].append(speed_kmh)
-                return speed_kmh
-        return None
-
-    def track_vehicles(self, detections, frame_number):
-        current_detections = []
-
-        for detection in detections:
-            box, label, confidence = detection
-            centroid = self.get_centroid(box)
-            best_match_id = None
-            best_match_score = 0
-
-            for vehicle_id, tracked_data in list(self.tracked_vehicles.items()):
-                if frame_number - tracked_data['last_frame'] <= 5:
-                    iou = self.calculate_iou(box, tracked_data['last_box'])
-                    centroid_dist = self.calculate_distance(
-                        centroid, tracked_data['last_centroid']
-                    )
-
-                    if tracked_data['label'] == label:
-                        if iou > 0.3 or centroid_dist < 150:
-                            score = iou * 0.7 + (1 - min(centroid_dist / 150, 1)) * 0.3
-                            if score > best_match_score:
-                                best_match_score = score
-                                best_match_id = vehicle_id
-
-            if best_match_id is not None and best_match_score > 0.3:
-                self.tracked_vehicles[best_match_id].update({
-                    'last_box': box,
-                    'last_centroid': centroid,
-                    'last_frame': frame_number,
-                    'detection_count': self.tracked_vehicles[best_match_id]['detection_count'] + 1
-                })
-                self.tracked_vehicles[best_match_id]['confidence'].append(confidence)
-                current_detections.append((best_match_id, box, label, confidence))
+def compute_speeds(tracker: SimpleTracker, meters_per_pixel: float, fps: float) -> Dict[int, float]:
+    """
+    Based on hist_positions, compute instantaneous speed (km/h) using last two positions for each object.
+    meters_per_pixel: scale provided by user (meters per pixel)
+    fps: frames per second of the video processed
+    """
+    speeds_kmph = {}
+    for oid, hist in tracker.hist_positions.items():
+        if len(hist) >= 2:
+            # use last two positions
+            (f1, c1), (f2, c2) = hist[-2], hist[-1]
+            dx = c2[0] - c1[0]
+            dy = c2[1] - c1[1]
+            dist_pixels = np.sqrt(dx*dx + dy*dy)
+            dist_m = dist_pixels * meters_per_pixel
+            time_s = (f2 - f1) / fps if fps > 0 else 1.0 / fps
+            if time_s == 0:
+                speed_m_s = 0.0
             else:
-                vehicle_id = self.next_vehicle_id
-                self.next_vehicle_id += 1
-                self.tracked_vehicles[vehicle_id] = {
-                    'label': label,
-                    'last_box': box,
-                    'last_centroid': centroid,
-                    'last_frame': frame_number,
-                    'first_frame': frame_number,
-                    'confidence': [confidence],
-                    'detection_count': 1
-                }
-                current_detections.append((vehicle_id, box, label, confidence))
+                speed_m_s = dist_m / time_s
+            speed_kmph = speed_m_s * 3.6
+            speeds_kmph[oid] = float(speed_kmph)
+    return speeds_kmph
 
-        stale_ids = [
-            vid for vid, data in self.tracked_vehicles.items()
-            if frame_number - data['last_frame'] > 30
-        ]
-        for vid in stale_ids:
-            del self.tracked_vehicles[vid]
+# ---------------------------
+# UI: Sidebar
+# ---------------------------
+st.sidebar.title("Model & Input")
+st.sidebar.write("Load model (local path relative to repo or upload below)")
 
-        return current_detections
+model_path_input = st.sidebar.text_input("Model path (e.g., yolov8n.pt)", value="yolov8n.pt")
+uploaded_model = st.sidebar.file_uploader("Or upload a .pt model file", type=["pt"], accept_multiple_files=False)
 
-    def get_valid_vehicles(self):
-        return {
-            vid: data for vid, data in self.tracked_vehicles.items()
-            if data['detection_count'] >= self.min_detection_frames
-        }
+model_path = model_path_input
+if uploaded_model is not None:
+    # save to temp file and use
+    tmp_model_file = os.path.join(tempfile.gettempdir(), uploaded_model.name)
+    with open(tmp_model_file, "wb") as f:
+        f.write(uploaded_model.getbuffer())
+    model_path = tmp_model_file
 
+load_model_btn = st.sidebar.button("Load model")
+if load_model_btn:
+    try:
+        model = load_model(model_path)
+        st.sidebar.success("Model loaded successfully.")
+    except Exception as e:
+        st.sidebar.error(f"Could not load model: {e}")
+        model = None
+else:
+    # try to load quietly, show message
+    try:
+        model = load_model(model_path)
+    except Exception:
+        model = None
 
-def get_class_color(class_name):
-    colors = {
-        'car': (0, 255, 0),
-        'truck': (0, 0, 255),
-        'bus': (255, 0, 0),
-        'motorbike': (255, 255, 0),
-        'bicycle': (255, 0, 255)
-    }
-    return colors.get(class_name, (255, 255, 255))
+confidence = st.sidebar.slider("Confidence threshold", 0.0, 1.0, 0.25, 0.01)
+iou = st.sidebar.slider("IOU threshold (for NMS)", 0.0, 1.0, 0.45, 0.01)
+max_det = st.sidebar.number_input("Max detections per frame", min_value=1, max_value=1000, value=300)
 
+st.sidebar.write("---")
+st.sidebar.write("Video speed estimation (optional)")
+meters_per_pixel = st.sidebar.number_input("meters_per_pixel (meters per pixel scale)", min_value=0.0, value=0.0, format="%.6f")
+fps_input = st.sidebar.number_input("FPS (frames per second of the video)", min_value=1.0, value=30.0)
 
-def preprocess_video(video_path, system):
-    cap = cv2.VideoCapture(video_path)
-    video_stats = {
-        'width': int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-        'height': int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-        'fps': cap.get(cv2.CAP_PROP_FPS) or 30.0,
-        'total_frames': int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
-    }
-    video_stats['duration'] = (
-        video_stats['total_frames'] / video_stats['fps']
-        if video_stats['fps'] > 0 else 0
-    )
-    cap.release()
-    system.video_stats = video_stats
-    return video_stats
+# ---------------------------
+# Main UI
+# ---------------------------
+st.title("Traffic Detection App (YOLO)")
 
+col1, col2 = st.columns([1,2])
 
-def process_video_with_analysis(video_path, system, fps, conf_threshold):
-    cap = cv2.VideoCapture(video_path)
-    width = system.video_stats['width']
-    height = system.video_stats['height']
-    total_frames = system.video_stats['total_frames']
+with col1:
+    st.header("Input")
+    input_type = st.selectbox("Input type", ("Image", "Video"))
+    uploaded_file = st.file_uploader("Upload file", type=["jpg","jpeg","png","mp4","mov","avi"])
+    run_button = st.button("Run Detection")
 
-    # temp file for processed video
-    temp_out = tempfile.NamedTemporaryFile(
-        suffix=".mp4", delete=False
-    )
-    output_path = temp_out.name
-    temp_out.close()
+with col2:
+    st.header("Detections / Output")
+    output_placeholder = st.empty()
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-    frame_count = 0
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        results = system.model(frame, conf=conf_threshold, iou=0.45, verbose=False)[0]
-
-        detections = []
-        if results.boxes is not None:
-            for box in results.boxes:
-                cls_id = int(box.cls[0])
-                label = system.model.names[cls_id]
-                confidence = float(box.conf[0])
-
-                if label in system.vehicle_classes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    detections.append(([x1, y1, x2, y2], label, confidence))
-
-        tracked_detections = system.track_vehicles(detections, frame_count)
-        valid_vehicles = system.get_valid_vehicles()
-
-        frame_counts = defaultdict(int)
-        frame_speeds = []
-
-        for vehicle_id, box, label, confidence in tracked_detections:
-            x1, y1, x2, y2 = box
-            frame_counts[label] += 1
-
-            centroid = system.get_centroid(box)
-            speed = system.calculate_speed(vehicle_id, centroid, frame_count, fps)
-
-            if speed is not None:
-                frame_speeds.append(speed)
-
-            color = get_class_color(label) if vehicle_id in valid_vehicles else (128, 128, 128)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            display_label = f'{label} {confidence:.2f}'
-            if speed is not None:
-                display_label += f' | {speed:.1f} km/h'
-            cv2.putText(
-                frame, display_label, (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2
-            )
-
-        # overlay similar to Colab version
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (450, 130), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-
-        cv2.putText(
-            frame, 'Traffic Analysis with Speed Detection', (20, 35),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
-        )
-        cv2.putText(
-            frame, f'Frame: {frame_count}/{total_frames}', (20, 65),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
-        )
-        cv2.putText(
-            frame, f'Vehicles in Frame: {sum(frame_counts.values())}', (20, 95),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2
-        )
-
-        if frame_speeds:
-            cv2.putText(
-                frame, f'Avg Speed: {np.mean(frame_speeds):.1f} km/h', (20, 125),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 100), 2
-            )
-
-        out.write(frame)
-        frame_count += 1
-
-    cap.release()
-    out.release()
-    return output_path
-
-
-# ================== STREAMLIT FRONTEND ==================
-
-st.set_page_config(page_title="Traffic Surveillance with YOLOv8", layout="wide")
-
-st.title("Traffic Surveillance System – YOLOv8")
-
-left_col, right_col = st.columns([3, 1])
-
-with right_col:
-    st.subheader("About this project")
-    st.markdown(
-        """
-This app performs automatic traffic analysis from CCTV videos using the YOLOv8 object detection model.
-It detects and tracks vehicles frame‑by‑frame, estimates their speed, and overlays metrics like vehicle count and average speed directly on the processed video.
-Upload any road‑side video clip to quickly visualize traffic behaviour for research, monitoring, or signal‑timing studies.
-        """
-    )
-
-with left_col:
-    uploaded_file = st.file_uploader(
-        "Upload a traffic video", type=["mp4", "avi", "mov", "mkv"]
-    )
-
-    if uploaded_file is not None:
-        with st.spinner("Saving uploaded video..."):
-            # save upload to a temp file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-                tmp.write(uploaded_file.read())
-                temp_input_path = tmp.name
-
-        st.success("Video uploaded. Starting processing...")
-
-        # sidebar controls
-        st.sidebar.header("Settings")
-        model_name = st.sidebar.selectbox(
-            "YOLOv8 model", ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt"],
-            index=4
-        )
-        conf_th = st.sidebar.slider(
-            "Confidence threshold", 0.1, 0.9, 0.4, 0.05
-        )
-        meter_per_pixel = st.sidebar.number_input(
-            "Meters per pixel (calibration)", min_value=0.001, max_value=1.0,
-            value=0.05, step=0.005, format="%.3f"
-        )
-
-        # main processing
-        system = TrafficSurveillanceSystem()
-        system.load_model(model_name)
-        system.set_calibration(meter_per_pixel)
-
-        stats = preprocess_video(temp_input_path, system)
-        fps = stats["fps"] if stats["fps"] > 0 else 30.0
-
-        start_time = time.time()
-        with st.spinner("Processing video with YOLOv8..."):
-            processed_path = process_video_with_analysis(
-                temp_input_path, system, fps, conf_th
-            )
-        end_time = time.time()
-
-        st.success(
-            f"Processing complete in {end_time - start_time:.1f} seconds. "
-            f"Duration: {stats['duration']:.1f} s, FPS used: {fps:.1f}"
-        )
-
-        # show only processed video
-        with open(processed_path, "rb") as f:
-            video_bytes = f.read()
-        st.video(video_bytes)
+# ---------------------------
+# Run detection flows
+# ---------------------------
+if run_button:
+    if model is None:
+        st.error("Model not loaded. Either provide a valid model path in the sidebar or upload a .pt model.")
+    elif uploaded_file is None:
+        st.warning("Please upload an image or video file.")
     else:
-        st.info("Please upload a traffic video to begin analysis.")
+        ext = uploaded_file.name.split(".")[-1].lower()
+        if input_type == "Image" and ext in ("jpg","jpeg","png"):
+            image_bytes = uploaded_file.read()
+            img = read_image_from_bytes(image_bytes)
+            # run prediction
+            try:
+                results = model.predict(source=img, imgsz=640, conf=confidence, iou=iou, max_det=max_det)
+            except TypeError:
+                # older/newer ultralytics wrappers: try alternative call
+                results = model(img, imgsz=640, conf=confidence, iou=iou, max_det=max_det)
+            detections = parse_yolo_results(results)
+            annotated = draw_boxes_on_image(img, detections)
+            st.image(cv2_to_pil(annotated), caption="Annotated image", use_column_width=True)
+            if detections:
+                df = pd.DataFrame(detections)
+                st.dataframe(df)
+                # prepare download of annotated image
+                buf = cv2.imencode(".jpg", annotated)[1].tobytes()
+                st.download_button("Download annotated image", data=buf, file_name="annotated.jpg", mime="image/jpeg")
+            else:
+                st.info("No detections above threshold.")
+        elif input_type == "Video" and ext in ("mp4","mov","avi"):
+            # Save uploaded video to temp file
+            tfile = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
+            tfile.write(uploaded_file.read())
+            tfile.flush()
+            tfile.close()
+            cap = cv2.VideoCapture(tfile.name)
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS) or float(fps_input)
+            out_path = os.path.join(tempfile.gettempdir(), f"annotated_{int(time.time())}.mp4")
+            writer = cv2.VideoWriter(out_path, fourcc, fps, (w,h))
+            tracker = SimpleTracker()
+            frame_idx = 0
+            results_list = []
+            progress_bar = st.progress(0)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            processed = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                # run detection on frame (BGR)
+                try:
+                    # ultralytics accepts numpy images (BGR)
+                    results = model.predict(source=frame, imgsz=640, conf=confidence, iou=iou, max_det=max_det)
+                except TypeError:
+                    results = model(frame, imgsz=640, conf=confidence, iou=iou, max_det=max_det)
+                detections = parse_yolo_results(results)
+                # tracker update
+                mapping = tracker.update(detections, frame_idx)
+                # compute speeds if scale provided
+                speeds = {}
+                if meters_per_pixel > 0 and fps > 0:
+                    speeds = compute_speeds(tracker, meters_per_pixel, fps)
+                # annotate frame with boxes and speed text
+                annotated = draw_boxes_on_image(frame, detections)
+                # add speed labels near tracked objects
+                for det_idx, oid in mapping.items():
+                    if oid in speeds:
+                        # place text in top-left corner of the bbox
+                        d = detections[det_idx]
+                        x1, y1 = int(d["xmin"]), int(d["ymin"])
+                        speed_text = f"{speeds[oid]:.1f} km/h"
+                        cv2.putText(annotated, speed_text, (x1, y1 - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+                writer.write(annotated)
+                frame_idx += 1
+                processed += 1
+                if total_frames > 0:
+                    progress_bar.progress(min(processed/total_frames, 1.0))
+            cap.release()
+            writer.release()
+            progress_bar.empty()
+            st.success("Video processing finished.")
+            # show video
+            with open(out_path, "rb") as f:
+                data = f.read()
+                st.video(data)
+                st.download_button("Download annotated video", data=data, file_name="annotated_video.mp4", mime="video/mp4")
+        else:
+            st.error("Uploaded file type does not match selected input type. Choose correct file or input type.")
+
+# ---------------------------
+# Footer / Notes
+# ---------------------------
+st.markdown("---")
+st.markdown(
+    """
+    **Notes & tips**
+    - Provide a model file (yolov8n.pt or your trained model) in the repo or upload it in the sidebar.
+    - For speed estimation: you must provide a realistic `meters_per_pixel` calibration (how many meters correspond to one pixel in your frames) and correct FPS.
+    - The tracker used here is a minimal centroid-matcher for demonstration only. For robust multi-object tracking consider SORT / DeepSORT / ByteTrack.
+    - On Streamlit Cloud, include required packages in `requirements.txt`.
+    """
+)
